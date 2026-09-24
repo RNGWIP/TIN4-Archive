@@ -2186,7 +2186,15 @@ const keyState = {
 const moveSpeed = 7.5;
 const keyTurnSpeed = 2.2;
 const lookSensitivity = 0.0022;
+const touchLookSensitivity = 0.0032;
 const maxPitch = Math.PI / 2 - 0.05;
+const USE_TOUCH_CONTROLS =
+  window.matchMedia('(pointer: coarse)').matches || window.matchMedia('(hover: none)').matches;
+const TAP_MOVE_PX = 14;
+const TAP_MAX_MS = 350;
+let lookTouch = null;
+let stickOrigin = null;
+let stickKnobEl = null;
 const gravity = 15;
 const jumpVelocityStart = 6.5;
 const maxJumps = 3;
@@ -2212,8 +2220,8 @@ function init() {
   );
   camera.position.set(-5, -5, 15);
 
-  renderer = new THREE.WebGLRenderer({ antialias: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer = new THREE.WebGLRenderer({ antialias: !USE_TOUCH_CONTROLS });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, USE_TOUCH_CONTROLS ? 1.25 : 2));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   // ACES ≈ Blender Filmic / AgX view transform for PBR materials.
@@ -2229,14 +2237,151 @@ function init() {
   setupBlenderStyleLighting();
 
   window.addEventListener('resize', onWindowResize);
+  window.visualViewport?.addEventListener('resize', onWindowResize);
   window.addEventListener('mousemove', onMouseMove);
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
-  window.addEventListener('click', onTvScreenClick);
-  window.addEventListener('click', onSceneClick);
+  if (USE_TOUCH_CONTROLS) {
+    setupMobileControls();
+  } else {
+    window.addEventListener('click', onTvScreenClick);
+    window.addEventListener('click', onSceneClick);
+  }
 
   setupFloorMusic();
   loadAllModels();
+}
+
+function setupMobileControls() {
+  const hud = document.createElement('div');
+  hud.id = 'mobile-hud';
+
+  const stick = document.createElement('div');
+  stick.id = 'mobile-stick';
+  stickKnobEl = document.createElement('div');
+  stickKnobEl.id = 'mobile-stick-knob';
+  stick.appendChild(stickKnobEl);
+
+  const jump = document.createElement('button');
+  jump.id = 'mobile-jump';
+  jump.type = 'button';
+  jump.textContent = 'JUMP';
+
+  const hint = document.createElement('div');
+  hint.id = 'mobile-hint';
+  hint.textContent = 'stick to walk · drag to look · tap to use';
+
+  hud.appendChild(stick);
+  hud.appendChild(jump);
+  hud.appendChild(hint);
+  document.body.appendChild(hud);
+
+  window.setTimeout(() => {
+    hint.style.opacity = '0';
+  }, 5000);
+
+  stick.addEventListener('pointerdown', (event) => {
+    if (uiModalOpen) return;
+    event.preventDefault();
+    stick.setPointerCapture(event.pointerId);
+    const rect = stick.getBoundingClientRect();
+    stickOrigin = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, id: event.pointerId };
+    updateJoystickFromPointer(event.clientX, event.clientY);
+  });
+  stick.addEventListener('pointermove', (event) => {
+    if (!stickOrigin || event.pointerId !== stickOrigin.id) return;
+    event.preventDefault();
+    updateJoystickFromPointer(event.clientX, event.clientY);
+  });
+  const endStick = (event) => {
+    if (!stickOrigin || event.pointerId !== stickOrigin.id) return;
+    stickOrigin = null;
+    keyState.forward = false;
+    keyState.backward = false;
+    keyState.left = false;
+    keyState.right = false;
+    if (stickKnobEl) stickKnobEl.style.transform = '';
+  };
+  stick.addEventListener('pointerup', endStick);
+  stick.addEventListener('pointercancel', endStick);
+
+  jump.addEventListener('pointerdown', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!uiModalOpen) tryJump();
+  });
+
+  window.addEventListener('pointerdown', onTouchLookDown);
+  window.addEventListener('pointermove', onTouchLookMove);
+  window.addEventListener('pointerup', onTouchLookUp);
+  window.addEventListener('pointercancel', onTouchLookUp);
+}
+
+function updateJoystickFromPointer(clientX, clientY) {
+  if (!stickOrigin || !stickKnobEl) return;
+  const dx = clientX - stickOrigin.x;
+  const dy = clientY - stickOrigin.y;
+  const maxR = 48;
+  const len = Math.hypot(dx, dy) || 1;
+  const scale = Math.min(len, maxR) / len;
+  const nx = dx * scale;
+  const ny = dy * scale;
+  stickKnobEl.style.transform = `translate(${nx}px, ${ny}px)`;
+  const dead = 14;
+  keyState.forward = ny < -dead;
+  keyState.backward = ny > dead;
+  keyState.left = nx < -dead;
+  keyState.right = nx > dead;
+}
+
+function isHudPointerTarget(target) {
+  if (!target || typeof target.closest !== 'function') return false;
+  if (target.closest('#mobile-hud')) return true;
+  const tag = target.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON' || tag === 'A';
+}
+
+function onTouchLookDown(event) {
+  if (uiModalOpen || lookTouch || isHudPointerTarget(event.target)) return;
+  if (event.pointerType === 'mouse') return;
+  lookTouch = {
+    id: event.pointerId,
+    x: event.clientX,
+    y: event.clientY,
+    startX: event.clientX,
+    startY: event.clientY,
+    startTime: performance.now(),
+    dragged: false,
+  };
+}
+
+function onTouchLookMove(event) {
+  if (!lookTouch || event.pointerId !== lookTouch.id || uiModalOpen) return;
+  const dx = event.clientX - lookTouch.x;
+  const dy = event.clientY - lookTouch.y;
+  const total = Math.hypot(event.clientX - lookTouch.startX, event.clientY - lookTouch.startY);
+  if (!lookTouch.dragged && total > TAP_MOVE_PX) lookTouch.dragged = true;
+  lookTouch.x = event.clientX;
+  lookTouch.y = event.clientY;
+  if (!lookTouch.dragged) return;
+  yaw -= dx * touchLookSensitivity;
+  pitch -= dy * touchLookSensitivity;
+  pitch = THREE.MathUtils.clamp(pitch, -maxPitch, maxPitch);
+}
+
+function onTouchLookUp(event) {
+  if (!lookTouch || event.pointerId !== lookTouch.id) return;
+  const dt = performance.now() - lookTouch.startTime;
+  const dist = Math.hypot(event.clientX - lookTouch.startX, event.clientY - lookTouch.startY);
+  const wasTap = !lookTouch.dragged && dist <= TAP_MOVE_PX && dt <= TAP_MAX_MS;
+  lookTouch = null;
+  if (!wasTap || uiModalOpen) return;
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+  updateTvScreenHover();
+  updateSceneHover();
+  onTvScreenClick();
+  onSceneClick();
 }
 
 function loadAllModels() {
@@ -2639,7 +2784,7 @@ function onMouseMove(event) {
   mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
   mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
 
-  if (uiModalOpen) return; // don't spin the camera while a menu/modal has focus
+  if (uiModalOpen || USE_TOUCH_CONTROLS) return; // don't spin the camera while a menu/modal has focus
 
   yaw -= event.movementX * lookSensitivity;
   pitch -= event.movementY * lookSensitivity;
